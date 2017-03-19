@@ -95,8 +95,11 @@ class ConsumerManager {
         considerAddingConsumers(false);
     }
 
-    void handleConstraintChange() {
-        considerAddingConsumers(true);
+    /**
+     * @return True if a new consumer is added or a waiting consumer is waken up
+     */
+    boolean handleConstraintChange() {
+        return considerAddingConsumers(true);
     }
 
     void handleStop() {
@@ -114,13 +117,17 @@ class ConsumerManager {
         }
     }
 
-    private void considerAddingConsumers(boolean pokeAllWaiting) {
+    /**
+     * @param pokeAllWaiting True if all waiting consumers should be poked instead of 1
+     * @return True if a consumer is poked or a new consumer is added
+     */
+    private boolean considerAddingConsumers(boolean pokeAllWaiting) {
         JqLog.d("considering adding a new consumer. Should poke all waiting? %s isRunning? %s"
                         + " waiting workers? %d"
                 , pokeAllWaiting, jobManagerThread.isRunning(), waitingConsumers.size());
         if (!jobManagerThread.isRunning()) {
             JqLog.d("jobqueue is not running, no consumers will be added");
-            return;
+            return false;
         }
         if (waitingConsumers.size() > 0) {
             JqLog.d("there are waiting workers, will poke them instead");
@@ -134,13 +141,15 @@ class ConsumerManager {
                 }
             }
             JqLog.d("there were waiting workers, poked them and I'm done");
-            return;
+            return true;
         }
         boolean isAboveLoadFactor = isAboveLoadFactor();
         JqLog.d("nothing has been poked. are we above load factor? %s", isAboveLoadFactor);
         if (isAboveLoadFactor) {
             addWorker();
+            return true;
         }
+        return false;
     }
 
     private void addWorker() {
@@ -155,7 +164,13 @@ class ConsumerManager {
             thread.setPriority(threadPriority);
         }
         consumers.add(consumer);
-        thread.start();
+        try {
+            thread.start();
+        } catch (InternalError error) {
+            // process is already dying, no reason to crash for this (and hide the real crash)
+            JqLog.e(error, "Cannot start a thread. Looks like app is shutting down."
+                    + "See issue #294 for details.");
+        }
     }
 
     private boolean isAboveLoadFactor() {
@@ -202,10 +217,11 @@ class ConsumerManager {
             return true;
         } else {
             long keepAliveTimeout = message.getLastJobCompleted() + consumerKeepAliveNs;
-            JqLog.d("keep alive: %s", keepAliveTimeout);
+            JqLog.v("keep alive: %s", keepAliveTimeout);
             final boolean tooMany = consumers.size() > minConsumerCount;
             boolean kill = !running || (tooMany && keepAliveTimeout < timer.nanoTime());
-            JqLog.d("Consumer idle, will kill? %s . isRunning: %s", kill, running);
+            JqLog.v("Consumer idle, will kill? %s. isRunning: %s. too many? %s timeout: %s now: %s",
+                    kill, running, tooMany, keepAliveTimeout, timer.nanoTime() );
             if (kill) {
                 CommandMessage command = factory.obtain(CommandMessage.class);
                 command.set(CommandMessage.QUIT);
@@ -326,7 +342,7 @@ class ConsumerManager {
 
         boolean hasJob;// controlled by the consumer controller to avoid multiple idle-job loops
 
-        long lastJobCompleted;
+        volatile long lastJobCompleted;
 
         static final MessagePredicate pokeMessagePredicate =
                 new MessagePredicate() {
@@ -343,7 +359,6 @@ class ConsumerManager {
                 switch (message.type) {
                     case RUN_JOB:
                         handleRunJob((RunJobMessage) message);
-                        lastJobCompleted = timer.nanoTime();
                         removePokeMessages();
                         break;
                     case COMMAND:
@@ -400,6 +415,8 @@ class ConsumerManager {
             resultMessage.setJobHolder(jobHolder);
             resultMessage.setResult(result);
             resultMessage.setWorker(this);
+            // update time here before posting the result
+            lastJobCompleted = timer.nanoTime();
             parentMessageQueue.post(resultMessage);
         }
     }
